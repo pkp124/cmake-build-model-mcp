@@ -2,7 +2,7 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { tail, type RunResult } from "./cmake/runner.js";
+import { COMPILE_COMMANDS_HINT, entryMatches } from "./compileCommands.js";
 import {
   dependencyGraph,
   findFile,
@@ -64,26 +64,17 @@ function handler<A>(fn: (args: A) => Promise<CallToolResult>): (args: A) => Prom
   };
 }
 
-function runSummary(result: RunResult, maxLines: number) {
-  return {
-    command: result.command,
-    exitCode: result.exitCode,
-    success: result.exitCode === 0,
-    timedOut: result.timedOut || undefined,
-    durationMs: result.durationMs,
-    output: tail(result.output, maxLines),
-  };
-}
-
 export function createServer(workspace: Workspace): McpServer {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
       instructions:
         "Query the build model (targets, sources, compile flags, include paths, defines, dependencies, cache " +
-        "variables, toolchains) of CMake projects via the CMake File API. Start with `list_projects` to see the " +
-        "source projects and build directories in the workspace; most tools take a `buildDir` argument. Use " +
-        "`find_file_targets` to learn how a specific source or header file is compiled.",
+        "variables, toolchains) of CMake projects via the CMake File API, plus the exact compile commands from " +
+        "compile_commands.json. The server is read-only and never runs CMake: build directories must already " +
+        "have been configured with File API queries. Start with `list_projects` to see the source projects and " +
+        "build directories in the workspace; most tools take a `buildDir` argument. Use `find_file_targets` to " +
+        "learn how a specific source or header file is compiled.",
     },
   );
 
@@ -93,6 +84,20 @@ export function createServer(workspace: Workspace): McpServer {
     const codemodel = (await reply.object("codemodel"))!;
     const config = selectConfiguration(codemodel, configuration, workspace.getBuildDirInfo(buildDir)?.buildType);
     return { buildDir, reply, config };
+  }
+
+  async function resolveFile(file: string): Promise<string> {
+    await workspace.ensureScanned();
+    return path.isAbsolute(file) ? path.normalize(file) : workspace.resolvePath(file);
+  }
+
+  /** Build directories whose source tree contains `file`, or all of them if none does. */
+  async function candidateBuildDirs(file: string, buildDir: string | undefined): Promise<string[]> {
+    if (buildDir) return [await workspace.resolveBuildDir(buildDir)];
+    const all = await workspace.allBuildDirs();
+    if (!all.length) throw new WorkspaceError("No CMake build directories found in the workspace.");
+    const owning = all.filter((b) => b.sourceDir && isWithin(file, b.sourceDir));
+    return (owning.length ? owning : all).map((b) => b.buildDir);
   }
 
   server.registerTool(
@@ -133,7 +138,7 @@ export function createServer(workspace: Workspace): McpServer {
         "Adds an existing CMake build directory (one containing CMakeCache.txt) that lies outside the workspace " +
         "roots, e.g. /tmp/build-foo, so the other tools can query it.",
       inputSchema: { buildDir: z.string().describe("Path to the build directory.") },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: READ_ONLY,
     },
     handler(async ({ buildDir }) => json(await workspace.registerBuildDir(buildDir))),
   );
@@ -149,59 +154,6 @@ export function createServer(workspace: Workspace): McpServer {
       annotations: READ_ONLY,
     },
     handler(async ({ sourceDir }) => json(await workspace.presets(sourceDir))),
-  );
-
-  server.registerTool(
-    "configure",
-    {
-      title: "Configure a CMake build directory",
-      description:
-        "Runs the CMake configure step so a fresh File API reply is generated. Three modes: (1) `sourceDir` + " +
-        "`preset` configures with a configure preset; (2) `sourceDir` (+ optional `buildDir`, default " +
-        "<sourceDir>/build) creates or updates a build directory; (3) only `buildDir` re-runs CMake on an " +
-        "existing build directory with its cached settings.",
-      inputSchema: {
-        sourceDir: z.string().optional().describe("Source directory containing the top-level CMakeLists.txt."),
-        buildDir: z.string().optional().describe("Build directory."),
-        preset: z.string().optional().describe("Configure preset name (requires sourceDir)."),
-        generator: z.string().optional().describe("CMake generator, e.g. 'Ninja' or 'Unix Makefiles' (new build dirs only)."),
-        buildType: z.string().optional().describe("Sets CMAKE_BUILD_TYPE."),
-        cacheVariables: z.record(z.string(), z.string()).optional().describe("Cache variables passed as -D<name>=<value>."),
-        extraArgs: z.array(z.string()).optional().describe("Additional raw arguments for cmake."),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    handler(async (args) => {
-      const { buildDir, result } = await workspace.configure(args);
-      return {
-        ...json({ buildDir, ...runSummary(result, 80), fileApi: await workspace.replyStatus(buildDir) }),
-        isError: result.exitCode !== 0,
-      };
-    }),
-  );
-
-  server.registerTool(
-    "build",
-    {
-      title: "Build targets",
-      description: "Runs `cmake --build` for a build directory, optionally limited to specific targets.",
-      inputSchema: {
-        buildDir: buildDirArg,
-        targets: z.array(z.string()).optional().describe("Targets to build; defaults to the 'all' target."),
-        configuration: configurationArg,
-        parallel: z.number().int().positive().optional().describe("Maximum number of parallel jobs."),
-        clean: z.boolean().optional().describe("Clean before building (--clean-first)."),
-        timeoutSeconds: z.number().positive().optional().describe("Timeout for the build."),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    handler(async ({ timeoutSeconds, ...args }) => {
-      const { buildDir, result } = await workspace.build({
-        ...args,
-        timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
-      });
-      return { ...json({ buildDir, ...runSummary(result, 120) }), isError: result.exitCode !== 0 };
-    }),
   );
 
   server.registerTool(
@@ -304,9 +256,10 @@ export function createServer(workspace: Workspace): McpServer {
       title: "Find how a file is built",
       description:
         "Finds which targets (in which build directories and configurations) compile a given source file, and " +
-        "returns the effective language, standard, flags, defines, include directories and an approximate " +
-        "compiler command line. For headers not listed as sources, returns targets whose include directories " +
-        "contain the file. Searches all known build directories unless `buildDir` is given.",
+        "returns the effective language, standard, flags, defines and include directories from the File API " +
+        "together with the exact compiler command(s) from the build directory's compile_commands.json. For " +
+        "headers not listed as sources, returns targets whose include directories contain the file. Searches " +
+        "all known build directories unless `buildDir` is given.",
       inputSchema: {
         file: z.string().describe("Path to the file (absolute or relative to a workspace root)."),
         buildDir: buildDirArg,
@@ -316,24 +269,18 @@ export function createServer(workspace: Workspace): McpServer {
       annotations: READ_ONLY,
     },
     handler(async ({ file, buildDir, configuration, includeBacktraces }) => {
-      await workspace.ensureScanned();
-      const absFile = path.isAbsolute(file) ? path.normalize(file) : workspace.resolvePath(file);
-      let candidates: string[];
-      if (buildDir) {
-        candidates = [await workspace.resolveBuildDir(buildDir)];
-      } else {
-        const all = await workspace.allBuildDirs();
-        const owning = all.filter((b) => b.sourceDir && isWithin(absFile, b.sourceDir));
-        candidates = (owning.length ? owning : all).map((b) => b.buildDir);
-      }
-      if (!candidates.length) return errorResult("No build directories known; use `configure` first.");
+      const absFile = await resolveFile(file);
+      const candidates = await candidateBuildDirs(absFile, buildDir);
 
       const matches: FileMatch[] = [];
       const errors: { buildDir: string; error: string }[] = [];
+      const withoutCompileCommands: string[] = [];
       for (const dir of candidates) {
         try {
           const reply = await workspace.getReply(dir, "codemodel");
-          matches.push(...(await findFile(reply, absFile, { configuration, includeBacktraces })));
+          const compileCommands = await workspace.compileCommands(dir);
+          if (!compileCommands) withoutCompileCommands.push(dir);
+          matches.push(...(await findFile(reply, absFile, { configuration, includeBacktraces, compileCommands })));
         } catch (err) {
           errors.push({ buildDir: dir, error: (err as Error).message });
         }
@@ -343,8 +290,67 @@ export function createServer(workspace: Workspace): McpServer {
         searchedBuildDirs: candidates,
         matchCount: matches.length,
         matches,
+        missingCompileCommands: withoutCompileCommands.length
+          ? { buildDirs: withoutCompileCommands, hint: COMPILE_COMMANDS_HINT }
+          : undefined,
         errors: errors.length ? errors : undefined,
       });
+    }),
+  );
+
+  server.registerTool(
+    "get_compile_commands",
+    {
+      title: "Get compile commands",
+      description:
+        "Reads the exact compiler invocations from compile_commands.json in a build directory, filtered by file, " +
+        "path pattern, target and/or configuration. When `file` is given without `buildDir`, every build " +
+        "directory of the workspace that compiles the file is searched. Each entry has the working directory, " +
+        "the argument list, the original command string (when the database uses `command`) and the output file.",
+      inputSchema: {
+        buildDir: buildDirArg,
+        file: z.string().optional().describe("Exact source file path (absolute or relative to a workspace root)."),
+        filter: z.string().optional().describe("Source path filter: substring, glob or /regex/."),
+        target: z.string().optional().describe("Only commands compiling objects of this target."),
+        configuration: z
+          .string()
+          .optional()
+          .describe("Only commands of this configuration (multi-config generators; ignored otherwise)."),
+        limit: z.number().int().positive().default(50).describe("Maximum number of entries per build directory."),
+      },
+      annotations: READ_ONLY,
+    },
+    handler(async ({ buildDir, file, filter, target, configuration, limit }) => {
+      const absFile = file ? await resolveFile(file) : undefined;
+      const candidates =
+        absFile && !buildDir ? await candidateBuildDirs(absFile, undefined) : [await workspace.resolveBuildDir(buildDir)];
+      const re = filter ? globOrRegex(filter) : undefined;
+
+      const results = [];
+      for (const dir of candidates) {
+        const db = await workspace.compileCommands(dir);
+        if (!db) {
+          results.push({ buildDir: dir, compileCommands: null, hint: COMPILE_COMMANDS_HINT });
+          continue;
+        }
+        const config = configuration && (await workspace.isMultiConfig(dir)) ? configuration : undefined;
+        const entries = (absFile ? db.forFile(absFile) : db.entries)
+          .filter((e) => !re || re.test(e.file))
+          .filter((e) => entryMatches(e, target, config));
+        if (absFile && !buildDir && !entries.length) continue;
+        results.push({
+          buildDir: dir,
+          compileCommands: db.file,
+          totalEntries: db.entries.length,
+          matchCount: entries.length,
+          truncated: entries.length > limit || undefined,
+          entries: entries.slice(0, limit),
+        });
+      }
+      if (absFile && !buildDir && !results.length) {
+        return errorResult(`No compile_commands.json entry for ${absFile} in: ${candidates.join(", ")}`);
+      }
+      return json(results.length === 1 && !absFile ? results[0] : { results });
     }),
   );
 

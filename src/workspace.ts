@@ -2,18 +2,12 @@ import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { readCMakeCacheTxt } from "./cmake/cache.js";
 import { loadPresets, type Presets } from "./cmake/presets.js";
-import { run, type RunResult } from "./cmake/runner.js";
-import { findLatestReplyIndex, hasQuery, Reply, writeQuery } from "./fileapi/reply.js";
-
-export type AutoConfigurePolicy = "never" | "missing" | "stale";
+import { CompileCommandsDb } from "./compileCommands.js";
+import { findLatestReplyIndex, QUERY_HINT, Reply } from "./fileapi/reply.js";
 
 export interface WorkspaceOptions {
   roots: string[];
-  cmakePath: string;
   maxScanDepth: number;
-  autoConfigure: AutoConfigurePolicy;
-  configureTimeoutMs: number;
-  buildTimeoutMs: number;
   extraBuildDirs?: string[];
 }
 
@@ -23,9 +17,8 @@ export interface BuildDirInfo {
   generator?: string;
   buildType?: string;
   configurationTypes?: string[];
-  cmakeCommand?: string;
   /** How this build directory was found. */
-  origin: "scan" | "preset" | "registered" | "configured";
+  origin: "scan" | "preset" | "registered";
 }
 
 export interface ProjectInfo {
@@ -37,7 +30,9 @@ export interface ProjectInfo {
 }
 
 export interface ReplyStatus {
-  hasQuery: boolean;
+  hasCodemodel: boolean;
+  /** Path of compile_commands.json when the build directory has one. */
+  compileCommands?: string;
   replyIndex?: string;
   generatedAt?: string;
   cmakeVersion?: string;
@@ -57,9 +52,9 @@ export class Workspace {
   private readonly buildDirs = new Map<string, BuildDirInfo>();
   private readonly projects = new Map<string, ProjectInfo>();
   private readonly replies = new Map<string, Reply>();
+  private readonly compileDbs = new Map<string, CompileCommandsDb>();
   private scanned: Promise<void> | undefined;
   private pendingRoots: Promise<void> | undefined;
-  private readonly configureLocks = new Map<string, Promise<unknown>>();
 
   constructor(readonly options: WorkspaceOptions) {
     this.roots = options.roots.map((r) => path.resolve(r));
@@ -183,8 +178,7 @@ export class Workspace {
       generator: cache.get("CMAKE_GENERATOR")?.value || undefined,
       buildType: cache.get("CMAKE_BUILD_TYPE")?.value || undefined,
       configurationTypes: configTypes ? configTypes.split(";").filter(Boolean) : undefined,
-      cmakeCommand: cache.get("CMAKE_COMMAND")?.value || undefined,
-      origin: previous && previous.origin !== "scan" && previous.origin !== "preset" ? previous.origin : origin,
+      origin: previous?.origin === "registered" ? previous.origin : origin,
     };
     this.buildDirs.set(buildDir, info);
     return info;
@@ -237,8 +231,8 @@ export class Workspace {
       if (all.length === 1) return all[0].buildDir;
       if (all.length === 0) {
         throw new WorkspaceError(
-          "No CMake build directories found in the workspace. Use the `configure` tool to create one, " +
-            "or `register_build_dir` to add one outside the workspace roots.",
+          "No CMake build directories found in the workspace. Configure a project with CMake first (with a " +
+            "File API query in place), or use `register_build_dir` to add one outside the workspace roots.",
         );
       }
       throw new WorkspaceError(
@@ -265,25 +259,11 @@ export class Workspace {
     return loadPresets(this.resolvePath(sourceDir));
   }
 
-  /** Returns a File API reply containing `kind`, configuring the build directory if policy allows. */
+  /** Returns the existing File API reply of a build directory, which must contain `kind`. */
   async getReply(buildDir: string, kind: "codemodel" | "cache" | "cmakeFiles" | "toolchains" = "codemodel"): Promise<Reply> {
-    await writeQuery(buildDir);
-    let reply = await this.loadReply(buildDir);
-    const policy = this.options.autoConfigure;
-    const missing = !reply || !reply.index.objects.some((o) => o.kind === kind);
-    const stale = !missing && policy === "stale" && (await this.modifiedInputs(reply!)).length > 0;
-    if ((missing && policy !== "never") || stale) {
-      const result = await this.reconfigure(buildDir);
-      if (result.exitCode !== 0) {
-        throw new WorkspaceError(`Automatic CMake configure of ${buildDir} failed:\n${result.output.slice(-4000)}`);
-      }
-      reply = await this.loadReply(buildDir);
-    }
+    const reply = await this.loadReply(buildDir);
     if (!reply || !reply.index.objects.some((o) => o.kind === kind)) {
-      throw new WorkspaceError(
-        `No File API '${kind}' reply in ${buildDir}. The query has been written; run the \`configure\` tool ` +
-          "(or re-run CMake yourself) to generate it.",
-      );
+      throw new WorkspaceError(`No CMake File API '${kind}' reply found in ${buildDir}.\n${QUERY_HINT}`);
     }
     return reply;
   }
@@ -317,13 +297,29 @@ export class Workspace {
     return modified.sort();
   }
 
-  async replyStatus(buildDir: string): Promise<ReplyStatus> {
-    const status: ReplyStatus = { hasQuery: await hasQuery(buildDir) };
+  /** Loads `<buildDir>/compile_commands.json`, or returns undefined when there is none. */
+  async compileCommands(buildDir: string): Promise<CompileCommandsDb | undefined> {
+    const db = await CompileCommandsDb.load(buildDir, this.compileDbs.get(buildDir));
+    if (db) this.compileDbs.set(buildDir, db);
+    else this.compileDbs.delete(buildDir);
+    return db;
+  }
+
+  /** Whether the build directory uses a multi-config generator (Ninja Multi-Config, Visual Studio, Xcode). */
+  async isMultiConfig(buildDir: string): Promise<boolean> {
     const reply = await this.loadReply(buildDir);
-    if (!reply) return status;
+    if (reply) return reply.index.cmake.generator.multiConfig;
+    return Boolean(this.buildDirs.get(buildDir)?.configurationTypes?.length);
+  }
+
+  async replyStatus(buildDir: string): Promise<ReplyStatus> {
+    const reply = await this.loadReply(buildDir);
+    const compileCommands = (await exists(CompileCommandsDb.path(buildDir))) ? CompileCommandsDb.path(buildDir) : undefined;
+    if (!reply) return { hasCodemodel: false, compileCommands };
     const modified = await this.modifiedInputs(reply);
     return {
-      ...status,
+      hasCodemodel: reply.index.objects.some((o) => o.kind === "codemodel"),
+      compileCommands,
       replyIndex: reply.indexFile,
       generatedAt: new Date(reply.indexMtimeMs).toISOString(),
       cmakeVersion: reply.index.cmake.version.string,
@@ -331,113 +327,6 @@ export class Workspace {
       modifiedInputs: modified.length ? modified.slice(0, 20) : undefined,
       stale: modified.length > 0,
     };
-  }
-
-  private cmakeFor(buildDir: string | undefined): string {
-    const fromCache = buildDir ? this.buildDirs.get(buildDir)?.cmakeCommand : undefined;
-    return fromCache ?? this.options.cmakePath;
-  }
-
-  private async withLock<T>(buildDir: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.configureLocks.get(buildDir) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(fn);
-    this.configureLocks.set(buildDir, next);
-    try {
-      return await next;
-    } finally {
-      if (this.configureLocks.get(buildDir) === next) this.configureLocks.delete(buildDir);
-    }
-  }
-
-  /** Re-runs CMake on an existing build directory using its cached settings. */
-  reconfigure(buildDir: string, extraArgs: string[] = []): Promise<RunResult> {
-    return this.withLock(buildDir, async () => {
-      await writeQuery(buildDir);
-      const result = await run(this.cmakeFor(buildDir), [...extraArgs, buildDir], {
-        cwd: buildDir,
-        timeoutMs: this.options.configureTimeoutMs,
-      });
-      await this.addBuildDir(buildDir, "configured");
-      return result;
-    });
-  }
-
-  async configure(opts: {
-    sourceDir?: string;
-    buildDir?: string;
-    preset?: string;
-    generator?: string;
-    buildType?: string;
-    cacheVariables?: Record<string, string>;
-    extraArgs?: string[];
-  }): Promise<{ buildDir: string; result: RunResult }> {
-    await this.ensureScanned();
-    const defs = Object.entries(opts.cacheVariables ?? {}).map(([k, v]) => `-D${k}=${v}`);
-    if (opts.buildType) defs.push(`-DCMAKE_BUILD_TYPE=${opts.buildType}`);
-    const genArgs = opts.generator ? ["-G", opts.generator] : [];
-    const extra = opts.extraArgs ?? [];
-
-    if (opts.preset) {
-      if (!opts.sourceDir) throw new WorkspaceError("`sourceDir` is required when configuring with a preset.");
-      const sourceDir = this.resolvePath(opts.sourceDir);
-      const presets = await loadPresets(sourceDir);
-      const preset = presets.configurePresets.find((p) => p.name === opts.preset);
-      if (!preset) {
-        throw new WorkspaceError(
-          `Configure preset '${opts.preset}' not found in ${sourceDir}. Available: ${presets.configurePresets.map((p) => p.name).join(", ") || "(none)"}`,
-        );
-      }
-      const buildDir = opts.buildDir ? this.resolvePath(opts.buildDir) : preset.binaryDir;
-      if (!buildDir) {
-        throw new WorkspaceError(`Preset '${opts.preset}' has no binaryDir; pass \`buildDir\` explicitly.`);
-      }
-      const args = ["--preset", opts.preset, ...(opts.buildDir ? ["-B", buildDir] : []), ...genArgs, ...defs, ...extra];
-      return this.runConfigure(buildDir, sourceDir, args);
-    }
-
-    if (opts.sourceDir) {
-      const sourceDir = this.resolvePath(opts.sourceDir);
-      if (!(await exists(path.join(sourceDir, "CMakeLists.txt")))) {
-        throw new WorkspaceError(`${sourceDir} has no CMakeLists.txt.`);
-      }
-      const buildDir = opts.buildDir ? this.resolvePath(opts.buildDir) : path.join(sourceDir, "build");
-      return this.runConfigure(buildDir, sourceDir, ["-S", sourceDir, "-B", buildDir, ...genArgs, ...defs, ...extra]);
-    }
-
-    const buildDir = await this.resolveBuildDir(opts.buildDir);
-    if (genArgs.length) throw new WorkspaceError("Changing the generator of an existing build directory is not supported.");
-    const result = await this.reconfigure(buildDir, [...defs, ...extra]);
-    return { buildDir, result };
-  }
-
-  private runConfigure(buildDir: string, cwd: string, args: string[]): Promise<{ buildDir: string; result: RunResult }> {
-    return this.withLock(buildDir, async () => {
-      await writeQuery(buildDir);
-      const result = await run(this.cmakeFor(buildDir), args, { cwd, timeoutMs: this.options.configureTimeoutMs });
-      const info = await this.addBuildDir(buildDir, "configured");
-      if (info?.sourceDir) await this.addProject(info.sourceDir, false);
-      return { buildDir, result };
-    });
-  }
-
-  async build(opts: {
-    buildDir?: string;
-    targets?: string[];
-    configuration?: string;
-    parallel?: number;
-    clean?: boolean;
-    timeoutMs?: number;
-  }): Promise<{ buildDir: string; result: RunResult }> {
-    const buildDir = await this.resolveBuildDir(opts.buildDir);
-    const args = ["--build", buildDir];
-    if (opts.configuration) args.push("--config", opts.configuration);
-    if (opts.targets?.length) args.push("--target", ...opts.targets);
-    if (opts.parallel !== undefined) args.push("--parallel", String(opts.parallel));
-    if (opts.clean) args.push("--clean-first");
-    const result = await this.withLock(buildDir, () =>
-      run(this.cmakeFor(buildDir), args, { cwd: buildDir, timeoutMs: opts.timeoutMs ?? this.options.buildTimeoutMs }),
-    );
-    return { buildDir, result };
   }
 }
 

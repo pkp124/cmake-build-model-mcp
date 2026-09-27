@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { cp, mkdtemp, rm, utimes } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, mkdir, mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,8 +17,26 @@ type Json = any;
 
 let tmp: string;
 let ws: string;
-let outside: string;
+/** Build dir outside the workspace roots with a File API reply but no compile_commands.json. */
+let outsideNoCompileDb: string;
+/** Build dir outside the roots configured without any File API query. */
+let outsideNoReply: string;
+/** Ninja Multi-Config build dir outside the roots. */
+let outsideMultiConfig: string;
 let client: Client;
+
+async function writeQueries(buildDir: string): Promise<void> {
+  const queryDir = path.join(buildDir, ".cmake", "api", "v1", "query");
+  await mkdir(queryDir, { recursive: true });
+  for (const q of ["codemodel-v2", "cache-v2", "cmakeFiles-v1", "toolchains-v1"]) {
+    await writeFile(path.join(queryDir, q), "");
+  }
+}
+
+async function cmake(args: string[], opts: { buildDir: string; cwd?: string; query?: boolean }): Promise<void> {
+  if (opts.query !== false) await writeQueries(opts.buildDir);
+  execFileSync("cmake", args, { cwd: opts.cwd, stdio: "ignore" });
+}
 
 async function call(name: string, args: Record<string, unknown> = {}): Promise<{ data: Json; isError: boolean; text: string }> {
   const result = (await client.callTool({ name, arguments: args })) as {
@@ -40,14 +59,34 @@ async function ok(name: string, args: Record<string, unknown> = {}): Promise<Jso
   return r.data;
 }
 
+async function listFilesRecursive(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { recursive: true });
+  return entries.map((e) => path.join(dir, e.toString())).sort();
+}
+
 beforeAll(async () => {
   tmp = await mkdtemp(path.join(os.tmpdir(), "cmake-mcp-e2e-"));
   ws = path.join(tmp, "ws");
-  outside = path.join(tmp, "outside-build");
+  outsideNoCompileDb = path.join(tmp, "outside-no-compile-db");
+  outsideNoReply = path.join(tmp, "outside-no-reply");
+  outsideMultiConfig = path.join(tmp, "outside-multi-config");
   await cp(path.join(here, "fixtures", "workspace"), ws, { recursive: true });
 
-  // A build directory configured outside the workspace and without our File API query.
-  execFileSync("cmake", ["-S", path.join(ws, "mathlib"), "-B", outside, "-DCMAKE_BUILD_TYPE=Debug"], { stdio: "ignore" });
+  const app = path.join(ws, "app");
+  const mathlib = path.join(ws, "mathlib");
+  const exportDb = "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON";
+  const appDebug = path.join(app, "build-debug");
+  await cmake(["-S", app, "-B", appDebug, "-DCMAKE_BUILD_TYPE=Debug", exportDb], { buildDir: appDebug });
+  await cmake(["--preset", "release", exportDb], { buildDir: path.join(app, "out", "build", "release"), cwd: app });
+  const mathBuild = path.join(mathlib, "build");
+  await cmake(["-S", mathlib, "-B", mathBuild, exportDb], { buildDir: mathBuild });
+  await cmake(["-S", mathlib, "-B", outsideNoCompileDb], { buildDir: outsideNoCompileDb });
+  await cmake(["-S", mathlib, "-B", outsideNoReply], { buildDir: outsideNoReply, query: false });
+  if (hasNinja) {
+    await cmake(["-S", mathlib, "-B", outsideMultiConfig, "-G", "Ninja Multi-Config", exportDb], {
+      buildDir: outsideMultiConfig,
+    });
+  }
 
   client = new Client({ name: "e2e", version: "0.0.0" });
   await client.connect(
@@ -61,15 +100,14 @@ afterAll(async () => {
 });
 
 describe("cmake-build-model MCP server", () => {
-  it("advertises its tools", async () => {
+  it("advertises only read-only tools", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
-        "build",
-        "configure",
         "find_file_targets",
         "get_cache_variables",
         "get_cmake_inputs",
+        "get_compile_commands",
         "get_project_summary",
         "get_target",
         "get_target_dependencies",
@@ -80,16 +118,25 @@ describe("cmake-build-model MCP server", () => {
         "register_build_dir",
       ].sort(),
     );
+    expect(tools.every((t) => t.annotations?.readOnlyHint === true)).toBe(true);
   });
 
-  it("discovers top-level projects but not subdirectories before anything is configured", async () => {
+  it("discovers projects and build directories of multiple projects", async () => {
     const data = await ok("list_projects");
     expect(data.projects.map((p: Json) => [p.name, p.sourceDir])).toEqual([
       ["App", path.join(ws, "app")],
       ["MathLib", path.join(ws, "mathlib")],
     ]);
-    expect(data.buildDirs).toEqual([]);
-    expect((await call("list_targets")).text).toMatch(/No CMake build directories found/);
+    expect(data.buildDirs.map((b: Json) => b.buildDir)).toEqual([
+      path.join(ws, "app", "build-debug"),
+      path.join(ws, "app", "out", "build", "release"),
+      path.join(ws, "mathlib", "build"),
+    ]);
+    expect(data.projects[0].buildDirs).toHaveLength(2);
+    for (const b of data.buildDirs) {
+      expect(b.fileApi).toMatchObject({ hasCodemodel: true, stale: false });
+      expect(b.fileApi.compileCommands).toBe(path.join(b.buildDir, "compile_commands.json"));
+    }
   });
 
   it("lists presets with resolved binary directories", async () => {
@@ -103,30 +150,6 @@ describe("cmake-build-model MCP server", () => {
       }),
     ]);
   });
-
-  it("configures multiple build directories for multiple projects", async () => {
-    const debug = await ok("configure", { sourceDir: "app", buildDir: "app/build-debug", buildType: "Debug" });
-    expect(debug.success).toBe(true);
-    expect(debug.fileApi.availableObjects).toEqual(
-      expect.arrayContaining([expect.stringMatching(/^codemodel-v2\./), expect.stringMatching(/^toolchains-v1\./)]),
-    );
-
-    const preset = await ok("configure", { sourceDir: "app", preset: "release" });
-    expect(preset.buildDir).toBe(path.join(ws, "app", "out", "build", "release"));
-
-    const math = await ok("configure", { sourceDir: path.join(ws, "mathlib") });
-    expect(math.buildDir).toBe(path.join(ws, "mathlib", "build"));
-
-    const data = await ok("list_projects", { rescan: true });
-    expect(data.buildDirs.map((b: Json) => b.buildDir)).toEqual([
-      path.join(ws, "app", "build-debug"),
-      path.join(ws, "app", "out", "build", "release"),
-      path.join(ws, "mathlib", "build"),
-    ]);
-    const app = data.projects.find((p: Json) => p.name === "App");
-    expect(app.buildDirs).toHaveLength(2);
-    for (const b of data.buildDirs) expect(b.fileApi.stale).toBe(false);
-  }, 120_000);
 
   it("requires disambiguation when several build directories exist", async () => {
     const noArg = await call("list_targets");
@@ -203,20 +226,49 @@ describe("cmake-build-model MCP server", () => {
     expect(dependents.dependents.map((d: Json) => d.name).sort()).toEqual(["app_cli", "plugin"]);
   });
 
-  it("finds the targets that compile a file across all build directories", async () => {
+  it("finds the targets that compile a file with the real compile commands", async () => {
     const data = await ok("find_file_targets", { file: "app/src/core.cpp" });
     expect(data.searchedBuildDirs).toHaveLength(2);
+    expect(data.missingCompileCommands).toBeUndefined();
     expect(data.matches.map((m: Json) => [path.relative(ws, m.buildDir), m.configuration, m.target])).toEqual([
       ["app/build-debug", "Debug", "core"],
       ["app/out/build/release", "Release", "core"],
     ]);
-    const cmd: string[] = data.matches[0].compileCommand;
-    expect(cmd).toEqual(expect.arrayContaining(["-DCORE_VERSION=3", `-I${path.join(ws, "app", "include")}`, "-c"]));
-    expect(cmd.at(-1)).toBe(path.join(ws, "app", "src", "core.cpp"));
+    const [debug, release] = data.matches;
+    expect(debug.compileCommands).toHaveLength(1);
+    const entry = debug.compileCommands[0];
+    expect(entry.file).toBe(path.join(ws, "app", "src", "core.cpp"));
+    expect(entry.directory).toBe(path.join(ws, "app", "build-debug"));
+    expect(entry.output).toMatch(/CMakeFiles\/core\.dir\/src\/core\.cpp\.o$/);
+    expect(entry.command).toContain("-DCORE_VERSION=3");
+    expect(entry.arguments).toEqual(
+      expect.arrayContaining(["-DCORE_VERSION=3", "-DCORE_INTERNAL", `-I${path.join(ws, "app", "include")}`, "-g", "-c"]),
+    );
+    expect(entry.arguments.at(-1)).toBe(path.join(ws, "app", "src", "core.cpp"));
+    expect(release.compileCommands[0].arguments).toContain("-O3");
 
     const header = await ok("find_file_targets", { file: path.join(ws, "mathlib", "src", "mathc.h") });
-    expect(header.matches.every((m: Json) => m.matchedBy === "include-directory")).toBe(true);
+    expect(header.matches.every((m: Json) => m.matchedBy === "include-directory" && !m.compileCommands)).toBe(true);
     expect(header.matches.map((m: Json) => m.target).sort()).toEqual(["calc", "mathc"]);
+  });
+
+  it("queries compile_commands.json directly", async () => {
+    const all = await ok("get_compile_commands", { buildDir: "app/build-debug" });
+    expect(all.compileCommands).toBe(path.join(ws, "app", "build-debug", "compile_commands.json"));
+    expect(all.totalEntries).toBe(3);
+
+    const byTarget = await ok("get_compile_commands", { buildDir: "app/build-debug", target: "plugin" });
+    expect(byTarget.entries.map((e: Json) => path.basename(e.file))).toEqual(["plugin.cpp"]);
+
+    const byFilter = await ok("get_compile_commands", { buildDir: "app/build-debug", filter: "*/tools/*", limit: 5 });
+    expect(byFilter.entries.map((e: Json) => path.basename(e.file))).toEqual(["main.cpp"]);
+
+    const acrossBuildDirs = await ok("get_compile_commands", { file: "app/tools/main.cpp" });
+    expect(acrossBuildDirs.results.map((r: Json) => r.buildDir)).toEqual([
+      path.join(ws, "app", "build-debug"),
+      path.join(ws, "app", "out", "build", "release"),
+    ]);
+    expect(acrossBuildDirs.results.every((r: Json) => r.entries[0].arguments.includes("-Wall"))).toBe(true);
   });
 
   it("returns cache variables, toolchains and cmake inputs", async () => {
@@ -233,7 +285,7 @@ describe("cmake-build-model MCP server", () => {
     expect(inputs.modifiedSinceConfigure).toEqual([]);
   });
 
-  it("flags stale replies when CMake inputs change and refreshes on configure", async () => {
+  it("flags stale replies when CMake inputs change and picks up a fresh reply", async () => {
     const file = path.join(ws, "mathlib", "CMakeLists.txt");
     const future = new Date(Date.now() + 60_000);
     await utimes(file, future, future);
@@ -244,43 +296,59 @@ describe("cmake-build-model MCP server", () => {
 
     const now = new Date();
     await utimes(file, now, now);
-    const reconfigured = await ok("configure", { buildDir: "mathlib/build" });
-    expect(reconfigured.success).toBe(true);
-    expect(reconfigured.fileApi.stale).toBe(false);
+    execFileSync("cmake", [path.join(ws, "mathlib", "build")], { stdio: "ignore" });
+    const refreshed = await ok("list_projects");
+    const after = refreshed.buildDirs.find((b: Json) => b.buildDir === path.join(ws, "mathlib", "build"));
+    expect(after.fileApi.stale).toBe(false);
   }, 60_000);
 
-  it("auto-configures registered build directories that have no reply yet", async () => {
-    const reg = await ok("register_build_dir", { buildDir: outside });
+  it("explains missing compile_commands.json", async () => {
+    await ok("register_build_dir", { buildDir: outsideNoCompileDb });
+    const file = await ok("find_file_targets", { file: "mathlib/src/calc.c", buildDir: outsideNoCompileDb });
+    expect(file.matches[0].compileCommands).toBeUndefined();
+    expect(file.missingCompileCommands.buildDirs).toEqual([outsideNoCompileDb]);
+    expect(file.missingCompileCommands.hint).toMatch(/CMAKE_EXPORT_COMPILE_COMMANDS/);
+
+    const direct = await ok("get_compile_commands", { buildDir: outsideNoCompileDb });
+    expect(direct.compileCommands).toBeNull();
+  });
+
+  it("never runs CMake or writes into build directories that lack a reply", async () => {
+    const before = await listFilesRecursive(outsideNoReply);
+    const reg = await ok("register_build_dir", { buildDir: outsideNoReply });
     expect(reg.sourceDir).toBe(path.join(ws, "mathlib"));
-    const targets = await ok("list_targets", { buildDir: outside });
-    expect(targets.targets.map((t: Json) => t.name).sort()).toEqual(["calc", "mathc"]);
-  }, 60_000);
 
-  it("builds a target", async () => {
-    const result = await ok("build", { buildDir: "app/build-debug", targets: ["app_cli"], parallel: 2 });
-    expect(result.success).toBe(true);
-    const failed = await call("build", { buildDir: "app/build-debug", targets: ["does_not_exist"] });
-    expect(failed.isError).toBe(true);
-  }, 120_000);
+    const listed = await call("list_targets", { buildDir: outsideNoReply });
+    expect(listed.isError).toBe(true);
+    expect(listed.text).toMatch(/No CMake File API 'codemodel' reply found/);
+    expect(listed.text).toMatch(/codemodel-v2/);
+
+    expect(existsSync(path.join(outsideNoReply, ".cmake"))).toBe(false);
+    expect(await listFilesRecursive(outsideNoReply)).toEqual(before);
+  });
 
   it.runIf(hasNinja)("handles multi-config generators", async () => {
-    const mc = await ok("configure", {
-      sourceDir: "mathlib",
-      buildDir: "mathlib/build-mc",
-      generator: "Ninja Multi-Config",
-    });
-    expect(mc.success).toBe(true);
-    const summary = await ok("get_project_summary", { buildDir: "mathlib/build-mc" });
+    await ok("register_build_dir", { buildDir: outsideMultiConfig });
+    const summary = await ok("get_project_summary", { buildDir: outsideMultiConfig });
     expect(summary.configurations).toEqual(expect.arrayContaining(["Debug", "Release", "RelWithDebInfo"]));
-    const release = await ok("get_target", { buildDir: "mathlib/build-mc", target: "calc", configuration: "release" });
+    const release = await ok("get_target", { buildDir: outsideMultiConfig, target: "calc", configuration: "release" });
     expect(release.configuration).toBe("Release");
     expect(release.artifacts[0]).toMatch(/Release/);
-    const bad = await call("list_targets", { buildDir: "mathlib/build-mc", configuration: "Nope" });
+    const bad = await call("list_targets", { buildDir: outsideMultiConfig, configuration: "Nope" });
     expect(bad.text).toMatch(/Configuration 'Nope' not found/);
 
-    const file = await ok("find_file_targets", { file: "mathlib/src/calc.c", buildDir: "mathlib/build-mc" });
-    expect(file.matches.map((m: Json) => m.configuration).sort()).toEqual(["Debug", "RelWithDebInfo", "Release"]);
-  }, 120_000);
+    const file = await ok("find_file_targets", { file: "mathlib/src/calc.c", buildDir: outsideMultiConfig });
+    const byConfig = Object.fromEntries(file.matches.map((m: Json) => [m.configuration, m.compileCommands]));
+    expect(Object.keys(byConfig).sort()).toEqual(["Debug", "RelWithDebInfo", "Release"]);
+    for (const [config, entries] of Object.entries(byConfig) as [string, Json[]][]) {
+      expect(entries).toHaveLength(1);
+      expect(entries[0].output).toContain(`.dir/${config}/`);
+    }
+
+    const releaseCmds = await ok("get_compile_commands", { buildDir: outsideMultiConfig, configuration: "Release" });
+    expect(releaseCmds.entries.every((e: Json) => e.output.includes(".dir/Release/"))).toBe(true);
+    expect(releaseCmds.matchCount).toBe(2);
+  });
 });
 
 describe("MCP client roots", () => {

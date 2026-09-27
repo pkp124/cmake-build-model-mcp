@@ -1,4 +1,5 @@
 import path from "node:path";
+import { entryMatches, type CompileCommand, type CompileCommandsDb } from "./compileCommands.js";
 import type { Reply } from "./fileapi/reply.js";
 import type {
   BacktraceGraph,
@@ -7,7 +8,6 @@ import type {
   CodemodelTargetRef,
   CompileGroup,
   Target,
-  Toolchain,
 } from "./fileapi/types.js";
 
 export class ModelError extends Error {}
@@ -271,7 +271,8 @@ export interface FileMatch {
   matchedBy: "source" | "include-directory";
   isGenerated?: boolean;
   compileGroup?: ReturnType<typeof describeCompileGroup>;
-  compileCommand?: string[];
+  /** Matching entries of the build directory's compile_commands.json, if it has one. */
+  compileCommands?: CompileCommand[];
 }
 
 /**
@@ -282,10 +283,10 @@ export interface FileMatch {
 export async function findFile(
   reply: Reply,
   file: string,
-  opts: { configuration?: string; includeBacktraces: boolean },
+  opts: { configuration?: string; includeBacktraces: boolean; compileCommands?: CompileCommandsDb },
 ): Promise<FileMatch[]> {
   const codemodel = (await reply.object("codemodel"))!;
-  const toolchains = (await reply.object("toolchains"))?.toolchains ?? [];
+  const multiConfig = reply.index.cmake.generator.multiConfig;
   const { source: srcRoot, build: buildRoot } = codemodel.paths;
   const target = path.normalize(file);
   const configs = opts.configuration
@@ -308,7 +309,9 @@ export async function findFile(
           matchedBy: "source",
           isGenerated: source.isGenerated || undefined,
           compileGroup: group && describeCompileGroup(group, t, opts.includeBacktraces, srcRoot),
-          compileCommand: group && approximateCompileCommand(group, target, toolchains),
+          compileCommands: opts.compileCommands
+            ?.forFile(target)
+            .filter((e) => entryMatches(e, t.name, multiConfig ? config.name : undefined)),
         });
         continue;
       }
@@ -326,33 +329,6 @@ export async function findFile(
     }
   }
   return direct.length ? direct : viaInclude;
-}
-
-/**
- * Reconstructs a representative compiler invocation (without output flags). CMake's real
- * command line (see compile_commands.json) may order or quote flags differently.
- */
-function approximateCompileCommand(group: CompileGroup, file: string, toolchains: Toolchain[]): string[] {
-  const compiler = toolchains.find((tc) => tc.language === group.language)?.compiler;
-  const msvcLike = compiler?.id === "MSVC" || /cl(\.exe)?$/i.test(compiler?.path ?? "");
-  const cmd: string[] = [compiler?.path ?? `<${group.language} compiler>`];
-  for (const d of group.defines ?? []) cmd.push(`${msvcLike ? "/D" : "-D"}${d.define}`);
-  for (const i of group.includes ?? []) {
-    if (msvcLike) cmd.push(`/I${i.path}`);
-    else if (i.isSystem) cmd.push("-isystem", i.path);
-    else cmd.push(`-I${i.path}`);
-  }
-  for (const f of group.compileCommandFragments ?? []) cmd.push(...splitFragment(f.fragment));
-  cmd.push(msvcLike ? "/c" : "-c", file);
-  return cmd;
-}
-
-function splitFragment(fragment: string): string[] {
-  const parts: string[] = [];
-  const re = /"((?:[^"\\]|\\.)*)"|(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(fragment))) parts.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, "$1") : m[2]);
-  return parts;
 }
 
 export function isWithin(child: string, parent: string): boolean {

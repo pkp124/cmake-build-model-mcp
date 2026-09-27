@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseCMakeCacheTxt } from "../src/cmake/cache.js";
 import { loadPresets } from "../src/cmake/presets.js";
+import { entryMatches, splitCommand } from "../src/compileCommands.js";
 import { globOrRegex, isWithin } from "../src/model.js";
 
 describe("parseCMakeCacheTxt", () => {
@@ -23,6 +24,43 @@ describe("parseCMakeCacheTxt", () => {
     expect(entries.get("CMAKE_HOME_DIRECTORY")?.value).toBe("/src/app");
     expect(entries.get("WEIRD:NAME")?.value).toBe("ON");
     expect(entries.get("NO_TYPE")).toEqual({ name: "NO_TYPE", type: "UNINITIALIZED", value: "value=with=equals" });
+  });
+});
+
+describe("splitCommand", () => {
+  it("splits POSIX shell command lines", () => {
+    expect(splitCommand(`/usr/bin/c++ -DA=1 -DMSG=\\"hi\\ there\\" '-I/a b' "-DQ=\\"x\\"" -c f.cpp`, "linux")).toEqual([
+      "/usr/bin/c++",
+      "-DA=1",
+      '-DMSG="hi there"',
+      "-I/a b",
+      '-DQ="x"',
+      "-c",
+      "f.cpp",
+    ]);
+  });
+
+  it("splits Windows command lines", () => {
+    expect(splitCommand(`C:\\cl.exe /nologo "-IC:\\a b\\inc" -DMSG=\\"hi\\" /c C:\\src\\f.cpp`, "win32")).toEqual([
+      "C:\\cl.exe",
+      "/nologo",
+      "-IC:\\a b\\inc",
+      '-DMSG="hi"',
+      "/c",
+      "C:\\src\\f.cpp",
+    ]);
+  });
+});
+
+describe("entryMatches", () => {
+  const entry = (output?: string) => ({ file: "/s/a.c", directory: "/b", arguments: [], output });
+  it("attributes entries to targets and configurations via the object path", () => {
+    expect(entryMatches(entry("tools/CMakeFiles/app.dir/main.cpp.o"), "app")).toBe(true);
+    expect(entryMatches(entry("CMakeFiles/app.dir/main.cpp.o"), "app")).toBe(true);
+    expect(entryMatches(entry("CMakeFiles/app2.dir/main.cpp.o"), "app")).toBe(false);
+    expect(entryMatches(entry("CMakeFiles/app.dir/Debug/main.cpp.o"), "app", "Debug")).toBe(true);
+    expect(entryMatches(entry("CMakeFiles/app.dir/Release/main.cpp.o"), "app", "Debug")).toBe(false);
+    expect(entryMatches(entry(undefined), "app", "Debug")).toBe(true);
   });
 });
 

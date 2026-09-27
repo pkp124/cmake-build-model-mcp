@@ -2,48 +2,14 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Cache, CmakeFiles, Codemodel, ReplyIndex, Target, Toolchains } from "./types.js";
 
-export const CLIENT_NAME = "client-cmake-build-model-mcp";
-
-export const QUERY_REQUESTS = [
-  { kind: "codemodel", version: 2 },
-  { kind: "cache", version: 2 },
-  { kind: "cmakeFiles", version: 1 },
-  { kind: "toolchains", version: 1 },
-] as const;
-
-export function apiDir(buildDir: string): string {
-  return path.join(buildDir, ".cmake", "api", "v1");
-}
+export const QUERY_HINT =
+  "This server only reads existing File API replies. Create the query files and re-run CMake configure, e.g.:\n" +
+  "  mkdir -p <build>/.cmake/api/v1/query && " +
+  "touch <build>/.cmake/api/v1/query/{codemodel-v2,cache-v2,cmakeFiles-v1,toolchains-v1}\n" +
+  "  cmake <build>";
 
 export function replyDir(buildDir: string): string {
-  return path.join(apiDir(buildDir), "reply");
-}
-
-export function queryFile(buildDir: string): string {
-  return path.join(apiDir(buildDir), "query", CLIENT_NAME, "query.json");
-}
-
-/** Writes a stateful client query so the next configure step generates the objects we need. */
-export async function writeQuery(buildDir: string): Promise<boolean> {
-  const file = queryFile(buildDir);
-  const contents = JSON.stringify({ requests: QUERY_REQUESTS }, null, 2) + "\n";
-  try {
-    if ((await fs.readFile(file, "utf8")) === contents) return false;
-  } catch {
-    // Missing query file; fall through and create it.
-  }
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, contents);
-  return true;
-}
-
-export async function hasQuery(buildDir: string): Promise<boolean> {
-  try {
-    await fs.access(queryFile(buildDir));
-    return true;
-  } catch {
-    return false;
-  }
+  return path.join(buildDir, ".cmake", "api", "v1", "reply");
 }
 
 export interface ReplyIndexInfo {
