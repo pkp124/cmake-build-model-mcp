@@ -4,14 +4,18 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants query t
 projects** — targets, sources, compile flags, include directories, defines, language standards, dependencies,
 artifacts, install rules, cache variables and toolchains — using the
 [CMake File API](https://cmake.org/cmake/help/latest/manual/cmake-file-api.7.html), plus the exact compiler
-invocations from `compile_commands.json`.
+invocations from `compile_commands.json`. It also queries the **ctest model** written into `CTestTestfile.cmake`
+(names, labels, fixtures, dependencies) and the results in `Test.xml`, so a large suite can be filtered without
+pasting those files into the conversation.
 
 Point it at one or more **build directories** that already contain a File API reply (for example `build-debug`
 and `build-release`, or a multi-config build). It can answer questions like *"how is this file compiled?"*
 across every build directory it was given.
 
-The server is **read-only**: it never runs CMake and never writes into build directories. It only reads what
-a previous CMake configure run left behind.
+The server is **read-only**: it never runs CMake, never executes tests, and never writes into build directories,
+except that `preview_test_run` with `engine: "ctest"` runs `ctest --show-only` (a dry run). That updates
+`Testing/Temporary/LastTest.log` and does not run test executables. Everything else only reads what a previous
+configure or `ctest -T Test` left behind.
 
 ## Prerequisites for build directories
 
@@ -57,6 +61,30 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 | `get_cache_variables` | Cache entries with type, value, help string; filterable. |
 | `get_toolchains` | Compilers per language with implicit include/link directories. |
 | `get_cmake_inputs` | Files CMake read during configure, glob dependencies, and inputs modified since then. |
+| `list_tests` | Tests from `CTestTestfile.cmake`: name, labels, disabled, directory, fixture roles. Capped. Name filters are a substring, glob, or `/regex/`. |
+| `get_test` | One test: command, properties, labels, fixtures, dependencies, backtrace. |
+| `list_labels` | Each label and how many tests have it. |
+| `list_fixtures` | Each fixture and the tests that set it up, require it, or clean it up. |
+| `get_test_dependencies` | `DEPENDS` and fixture edges, direct or transitive. |
+| `preview_test_run` | Dry run of a ctest selection (`-R`, `-E`, `-L`, `-LE`, exact names, `--rerun-failed`, `-FA`/`-FS`/`-FC`). Returns tests that would run, disabled matches, and fixture tests ctest would add. |
+| `get_test_run_summary` | Counts and timing from `Testing/<tag>/Test.xml`. |
+| `list_test_results` | Per-test status, time, and exit code. No stdout. Accepts the same selection as `preview_test_run`. |
+| `get_test_result` | One test's measurements and stdout, truncated to `maxOutputBytes`. |
+
+`list_build_dirs` includes a `ctest` object: `hasTestfile`, and `testXml` when `Testing/TAG` points at a `Test.xml`.
+
+### Test selection
+
+`preview_test_run` and `list_test_results` take ctest's filters:
+
+- `include` / `exclude` are `-R` / `-E`: one regex each, unanchored and case-sensitive. `^` and `$` anchor. `|` ORs names.
+- `labels` / `excludeLabels` are repeatable `-L` / `-LE`. Every regex must match some label on the test (AND). Put `tue|wed` in one entry to OR labels.
+- A match does not pull `DEPENDS` tests into the set. It does pull `FIXTURES_SETUP` and `FIXTURES_CLEANUP` for fixtures a selected test requires, unless `-FA`, `-FS`, or `-FC` says otherwise. Disabled matches are listed and do not pull fixtures.
+- `engine: "index"` (the default) parses `CTestTestfile.cmake` and does not run ctest. `{` and `}` are literal. `\d`, `\b`, lookaheads, and lazy quantifiers are rejected because ctest's `string(REGEX)` engine does not have them.
+- `engine: "ctest"` runs `ctest --show-only=json-v1` with the same flags. Use it when a command still contains a generator expression. Exact name lists need CMake 3.29+ (`--tests-from-file`).
+- `explain: true` adds up to 20 names for each reason a test was left out.
+
+`Test.xml` is the file written by `ctest -T Test` (the dashboard test step), not by a plain `ctest` invocation. Pass `testXml` to read a copy from somewhere else. The result index keeps status and timing; stdout is read only for `get_test_result`.
 
 Most tools accept a `buildDir` argument: the absolute path given at startup, or a unique suffix of one
 (`build-debug`, `app/build-debug`). Omit it when the server was started with a single build directory.
@@ -173,6 +201,11 @@ claude mcp add cmake-build-model -- node /path/to/cmake-build-model-mcp/dist/ind
 - `INTERFACE` libraries only appear in the codemodel when they have sources (a CMake File API rule).
 - `compile_commands.json` is not produced by the Visual Studio and Xcode generators; for those, use the
   File API compile groups returned by `get_target` / `find_file_targets`.
+- Test parsing understands the `CTestTestfile.cmake` files CMake generates (`add_test`, `set_tests_properties`,
+  `set_directory_properties`, `subdirs`, and `if(CTEST_CONFIGURATION_TYPE MATCHES ...)`). Hand-written logic
+  (`foreach`, `include`, other `if` conditions) is skipped and reported in `warnings`.
+- Directory `LABELS` are unioned with each test's own labels. Generator expressions are left as written unless
+  `preview_test_run` is called with `engine: "ctest"`.
 
 ## Development
 

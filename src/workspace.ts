@@ -2,6 +2,9 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { readCMakeCacheTxt } from "./cmake/cache.js";
 import { CompileCommandsDb } from "./compileCommands.js";
+import { CtestError } from "./ctest/error.js";
+import { locateTestXml, TestRun, type LocatedResults } from "./ctest/results.js";
+import { TestIndex } from "./ctest/testfile.js";
 import { findLatestReplyIndex, QUERY_HINT, Reply } from "./fileapi/reply.js";
 
 export interface WorkspaceOptions {
@@ -37,6 +40,8 @@ export class Workspace {
   private readonly buildDirs = new Map<string, BuildDirInfo>();
   private readonly replies = new Map<string, Reply>();
   private readonly compileDbs = new Map<string, CompileCommandsDb>();
+  private readonly testIndexes = new Map<string, TestIndex>();
+  private readonly testRuns = new Map<string, TestRun>();
   private loaded: Promise<void> | undefined;
 
   constructor(readonly options: WorkspaceOptions) {
@@ -203,6 +208,37 @@ export class Workspace {
     const reply = await this.loadReply(buildDir);
     if (reply) return reply.index.cmake.generator.multiConfig;
     return Boolean(this.buildDirs.get(buildDir)?.configurationTypes?.length);
+  }
+
+  /** Parsed CTestTestfile tree for a build directory. Reloads when a test file's size or mtime changes. */
+  async testIndex(buildDir: string): Promise<TestIndex> {
+    await this.ensureLoaded();
+    const index = await TestIndex.load(buildDir, this.testIndexes.get(buildDir));
+    if (!index) {
+      throw new CtestError(
+        `No CTestTestfile.cmake in ${buildDir}. Configure a project that calls enable_testing() and add_test().`,
+      );
+    }
+    this.testIndexes.set(buildDir, index);
+    return index;
+  }
+
+  /** Parsed Test.xml. `located` comes from locateTestXml. */
+  async testRun(located: LocatedResults): Promise<TestRun> {
+    const run = await TestRun.load(located, this.testRuns.get(located.file));
+    this.testRuns.set(located.file, run);
+    return run;
+  }
+
+  /** Whether this build directory has a generated test list and a Test.xml from `ctest -T Test`. */
+  async ctestStatus(buildDir: string): Promise<{ hasTestfile: boolean; tag?: string; track?: string; testXml?: string }> {
+    const hasTestfile = await exists(path.join(buildDir, "CTestTestfile.cmake"));
+    try {
+      const located = await locateTestXml(buildDir);
+      return { hasTestfile, tag: located.tag, track: located.track, testXml: located.file };
+    } catch {
+      return { hasTestfile };
+    }
   }
 
   async replyStatus(buildDir: string): Promise<ReplyStatus> {
