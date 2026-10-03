@@ -90,6 +90,10 @@ beforeAll(async () => {
       buildDir: outsideMultiConfig,
     });
   }
+  const tested = spawnSync("ctest", ["-T", "Test", "--output-on-failure"], { cwd: appDebug, encoding: "utf8" });
+  if (!existsSync(path.join(appDebug, "Testing", "TAG"))) {
+    throw new Error(`ctest -T Test did not write Testing/TAG\n${tested.stdout}\n${tested.stderr}`);
+  }
 
   const buildDirs = [appDebug, appRelease, mathBuild, outsideNoCompileDb, outsideNoReply];
   if (hasNinja) buildDirs.push(outsideMultiConfig);
@@ -120,9 +124,18 @@ describe("cmake-build-model MCP server", () => {
         "get_project_summary",
         "get_target",
         "get_target_dependencies",
+        "get_test",
+        "get_test_dependencies",
+        "get_test_result",
+        "get_test_run_summary",
         "get_toolchains",
         "list_build_dirs",
+        "list_fixtures",
+        "list_labels",
         "list_targets",
+        "list_test_results",
+        "list_tests",
+        "preview_test_run",
       ].sort(),
     );
     expect(tools.every((t) => t.annotations?.readOnlyHint === true)).toBe(true);
@@ -354,6 +367,96 @@ describe("cmake-build-model MCP server", () => {
     const releaseCmds = await ok("get_compile_commands", { buildDir: outsideMultiConfig, configuration: "Release" });
     expect(releaseCmds.entries.every((e: Json) => e.output.includes(".dir/Release/"))).toBe(true);
     expect(releaseCmds.matchCount).toBe(2);
+  });
+
+  it("queries the ctest model and the last test run", async () => {
+    const listed = await ok("list_tests", { buildDir: appDebug, limit: 20 });
+    expect(listed.count).toBeGreaterThanOrEqual(8);
+    expect(listed.tests.map((t: Json) => t.name)).toEqual(
+      expect.arrayContaining(["app.pass", "app.needs", "app.disabled", "app.tool"]),
+    );
+    const pass = listed.tests.find((t: Json) => t.name === "app.pass");
+    expect(pass.labels).toEqual(expect.arrayContaining(["app", "unit", "fast"]));
+    expect(pass.disabled).toBeUndefined();
+
+    const needs = await ok("get_test", { buildDir: appDebug, name: "app.needs" });
+    expect(needs.depends).toEqual(["app.pass"]);
+    expect(needs.fixtures.required).toEqual(["db"]);
+    expect(needs.command.at(-1)).toBe("needs");
+    expect(needs.workingDirectory).toBe(appDebug);
+
+    const tool = await ok("get_test", { buildDir: appDebug, name: "app.tool" });
+    expect(tool.workingDirectory).toBe(path.join(appDebug, "tools"));
+    expect(tool.labels).toEqual(expect.arrayContaining(["cli"]));
+
+    const labels = await ok("list_labels", { buildDir: appDebug });
+    expect(labels.labels.map((l: Json) => l.label)).toEqual(expect.arrayContaining(["app", "unit", "setup"]));
+
+    const fixtures = await ok("list_fixtures", { buildDir: appDebug });
+    expect(fixtures.fixtures).toEqual([
+      expect.objectContaining({
+        name: "db",
+        setup: ["app.setup"],
+        required: ["app.needs"],
+        cleanup: ["app.cleanup"],
+      }),
+    ]);
+
+    const deps = await ok("get_test_dependencies", { buildDir: appDebug, name: "app.needs" });
+    expect(deps.tests.map((t: Json) => t.name).sort()).toEqual(["app.cleanup", "app.pass", "app.setup"]);
+    expect(deps.edges).toEqual(
+      expect.arrayContaining([
+        { from: "app.needs", to: "app.pass", kind: "depends" },
+        { from: "app.needs", to: "app.setup", kind: "fixture-setup", fixture: "db" },
+        { from: "app.needs", to: "app.cleanup", kind: "fixture-cleanup", fixture: "db" },
+      ]),
+    );
+
+    const preview = await ok("preview_test_run", { buildDir: appDebug, include: "^app\\.needs$", explain: true });
+    expect(preview.engine).toBe("index");
+    expect(preview.selected.map((t: Json) => t.name)).toEqual(["app.needs"]);
+    expect(preview.addedByFixture.map((t: Json) => t.name).sort()).toEqual(["app.cleanup", "app.setup"]);
+    expect(preview.counts.excluded.include).toBeGreaterThan(0);
+    expect(preview.command).toEqual(expect.arrayContaining(["--show-only=json-v1", "-R", "^app\\.needs$"]));
+
+    const blocked = await ok("preview_test_run", { buildDir: appDebug, include: "^app\\.needs$", fixtureExcludeAny: "^db$" });
+    expect(blocked.addedByFixture).toEqual([]);
+
+    const fromCtest = await ok("preview_test_run", {
+      buildDir: appDebug,
+      include: "^app\\.needs$",
+      engine: "ctest",
+      includeCommands: true,
+    });
+    expect(fromCtest.selected.map((t: Json) => t.name)).toEqual(["app.needs"]);
+    expect(fromCtest.addedByFixture.map((t: Json) => t.name).sort()).toEqual(["app.cleanup", "app.setup"]);
+    expect(fromCtest.selected[0].command.at(-1)).toBe("needs");
+
+    const bad = await call("preview_test_run", { buildDir: appDebug, include: "(?=" });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/does not support/);
+
+    const summary = await ok("get_test_run_summary", { buildDir: appDebug });
+    expect(summary.file).toBe(path.join(appDebug, "Testing", summary.tag, "Test.xml"));
+    expect(summary.counts.failed).toBeGreaterThanOrEqual(1);
+    expect(summary.counts.passed).toBeGreaterThanOrEqual(1);
+
+    const failed = await ok("list_test_results", { buildDir: appDebug, status: "failed" });
+    expect(failed.tests.map((t: Json) => t.name)).toContain("app.broken");
+    expect(failed.tests.every((t: Json) => t.output === undefined)).toBe(true);
+
+    const selectedResults = await ok("list_test_results", { buildDir: appDebug, include: "^app\\.needs$" });
+    expect(selectedResults.tests.map((t: Json) => t.name).sort()).toEqual(["app.cleanup", "app.needs", "app.setup"]);
+
+    const one = await ok("get_test_result", { buildDir: appDebug, name: "app.pass", maxOutputBytes: 2 });
+    expect(one.status).toBe("passed");
+    expect(one.outputBytes).toBeGreaterThan(2);
+    expect(one.truncated).toBe(true);
+    expect(Buffer.byteLength(one.output)).toBeLessThanOrEqual(2);
+
+    const noTests = await call("list_tests", { buildDir: mathBuild });
+    expect(noTests.isError).toBe(true);
+    expect(noTests.text).toMatch(/No CTestTestfile\.cmake/);
   });
 });
 

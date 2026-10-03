@@ -7,9 +7,11 @@ import { Workspace } from "./workspace.js";
 
 const USAGE = `Usage: cmake-build-model-mcp [options] <build-dir>...
 
-MCP server (stdio) exposing the CMake File API build model of the given build directories.
-Read-only: it never runs CMake. Each build directory must already contain a File API reply
-(codemodel-v2).
+MCP server (stdio) exposing the CMake File API build model of the given build directories,
+plus CTest test lists (CTestTestfile.cmake) and CTest Test.xml results.
+Read-only: it never runs CMake or test executables. preview_test_run with engine ctest runs
+ctest --show-only, which lists tests and does not execute them. Each build directory must
+already contain a File API reply (codemodel-v2).
 
 Options:
   --build-dir <dir>   Build directory (repeatable). Positional arguments are build directories too.
