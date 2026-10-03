@@ -6,9 +6,9 @@ artifacts, install rules, cache variables and toolchains — using the
 [CMake File API](https://cmake.org/cmake/help/latest/manual/cmake-file-api.7.html), plus the exact compiler
 invocations from `compile_commands.json`.
 
-It is workspace-aware: it discovers **multiple CMake projects** under one or more roots and **multiple build
-directories per project** (e.g. `build-debug`, `build-release`, preset build trees, multi-config generators),
-and can answer questions like *"how is this file compiled?"* across all of them at once.
+Point it at one or more **build directories** that already contain a File API reply (for example `build-debug`
+and `build-release`, or a multi-config build). It can answer questions like *"how is this file compiled?"*
+across every build directory it was given.
 
 The server is **read-only**: it never runs CMake and never writes into build directories. It only reads what
 a previous CMake configure run left behind.
@@ -33,10 +33,8 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 ## How it works
 
-1. **Discovery.** Each workspace root is scanned for top-level `CMakeLists.txt` files (source projects) and for
-   `CMakeCache.txt` files (build directories). A build directory is linked to its project through
-   `CMAKE_HOME_DIRECTORY`, and the `binaryDir` of configure presets in `CMakePresets.json` /
-   `CMakeUserPresets.json` is resolved, so build trees outside the roots are found too.
+1. **Build directories.** Each directory passed on the command line is recorded. `CMakeCache.txt` in that
+   directory supplies the source directory, generator and build type.
 2. **Reply.** The newest `.cmake/api/v1/reply/index-*.json` is read; objects are loaded lazily and cached until
    the reply index changes, so re-configuring outside the server is picked up automatically.
 3. **Compile commands.** `<buildDir>/compile_commands.json` is loaded (and re-loaded when it changes) and
@@ -49,23 +47,22 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 | Tool | Purpose |
 | --- | --- |
-| `list_projects` | Source projects and build directories in the workspace, with generator, build type, File API status (codemodel present, stale, modified inputs) and `compile_commands.json` location. |
-| `register_build_dir` | Add an existing build directory that lives outside the workspace roots. |
-| `list_presets` | Configure and build presets of a source directory, with resolved binary directories. |
+| `list_build_dirs` | The build directories given at startup, with source directory, generator, build type, File API status (codemodel present, stale, modified inputs) and `compile_commands.json` location. |
 | `get_project_summary` | CMake version, generator, configurations, `project()` hierarchy, targets grouped by type. |
 | `list_targets` | Targets filtered by type, name (substring / glob / `/regex/`), project or directory. |
 | `get_target` | Everything about one target: definition site, artifacts, dependencies, compile groups (flags, defines, includes, standard, PCH), link/archive fragments, install destinations, sources, optional backtraces. |
 | `get_target_dependencies` | Direct or transitive dependencies or dependents of a target. |
-| `find_file_targets` | Which targets compile a file (in every build directory and configuration), with the File API compile settings and the matching `compile_commands.json` entries. Headers fall back to targets whose include directories contain them. |
-| `get_compile_commands` | Exact entries of `compile_commands.json` (directory, arguments, original command, output), filtered by file, path pattern, target or configuration; searches all build directories when only `file` is given. |
+| `find_file_targets` | Which targets compile a file (in every given build directory and configuration), with the File API compile settings and the matching `compile_commands.json` entries. Headers fall back to targets whose include directories contain them. |
+| `get_compile_commands` | Exact entries of `compile_commands.json` (directory, arguments, original command, output), filtered by file, path pattern, target or configuration; searches the given build directories when only `file` is given. |
 | `get_cache_variables` | Cache entries with type, value, help string; filterable. |
 | `get_toolchains` | Compilers per language with implicit include/link directories. |
 | `get_cmake_inputs` | Files CMake read during configure, glob dependencies, and inputs modified since then. |
 
-Most tools accept a `buildDir` argument: an absolute path, a path relative to a workspace root, or a source
-directory that has exactly one build directory. It can be omitted when the workspace has a single build
-directory. Multi-config generators (Visual Studio, Xcode, Ninja Multi-Config) are supported through the
-`configuration` argument.
+Most tools accept a `buildDir` argument: the absolute path given at startup, or a unique suffix of one
+(`build-debug`, `app/build-debug`). Omit it when the server was started with a single build directory.
+File paths may be absolute, relative to the working directory, or relative to a build's source directory
+when that match is unique. Multi-config generators (Visual Studio, Xcode, Ninja Multi-Config) are supported
+through the `configuration` argument.
 
 Example `find_file_targets` result:
 
@@ -119,12 +116,10 @@ npm install        # also builds dist/
 The server speaks MCP over stdio.
 
 ```text
-cmake-build-model-mcp [options] [root...]
+cmake-build-model-mcp [options] <build-dir>...
 
-  --root <dir>        Workspace root to scan (repeatable; also CMAKE_MCP_ROOTS).
-                      Without roots, the client's MCP roots are used, else the current directory.
-  --build-dir <dir>   Additional build directory outside the roots (repeatable).
-  --max-depth <n>     Maximum scan depth below each root (default: 6).
+  --build-dir <dir>   Build directory that already contains a File API reply (repeatable).
+                      Positional arguments are build directories too.
 ```
 
 ### Cursor (`.cursor/mcp.json`)
@@ -134,11 +129,13 @@ cmake-build-model-mcp [options] [root...]
   "mcpServers": {
     "cmake-build-model": {
       "command": "node",
-      "args": ["/path/to/cmake-build-model-mcp/dist/index.js", "--root", "${workspaceFolder}"]
+      "args": ["/path/to/cmake-build-model-mcp/dist/index.js", "/path/to/build"]
     }
   }
 }
 ```
+
+Pass every build directory you want to query (debug and release, or several projects).
 
 ### Claude Desktop / Claude Code
 
@@ -147,19 +144,17 @@ cmake-build-model-mcp [options] [root...]
   "mcpServers": {
     "cmake-build-model": {
       "command": "node",
-      "args": ["/path/to/cmake-build-model-mcp/dist/index.js", "/path/to/workspace"]
+      "args": ["/path/to/cmake-build-model-mcp/dist/index.js", "/path/to/build"]
     }
   }
 }
 ```
 
 ```bash
-claude mcp add cmake-build-model -- node /path/to/cmake-build-model-mcp/dist/index.js "$PWD"
+claude mcp add cmake-build-model -- node /path/to/cmake-build-model-mcp/dist/index.js /path/to/build
 ```
 
 ### VS Code (`.vscode/mcp.json`)
-
-VS Code provides MCP roots, so no `--root` is needed:
 
 ```json
 {
@@ -167,7 +162,7 @@ VS Code provides MCP roots, so no `--root` is needed:
     "cmake-build-model": {
       "type": "stdio",
       "command": "node",
-      "args": ["/path/to/cmake-build-model-mcp/dist/index.js"]
+      "args": ["/path/to/cmake-build-model-mcp/dist/index.js", "/path/to/build"]
     }
   }
 }
@@ -175,12 +170,9 @@ VS Code provides MCP roots, so no `--root` is needed:
 
 ## Notes and limitations
 
-- Top-level projects are detected as `CMakeLists.txt` files with no `CMakeLists.txt` in an ancestor
-  directory below the root; nested independent projects are picked up once they have a build directory.
 - `INTERFACE` libraries only appear in the codemodel when they have sources (a CMake File API rule).
 - `compile_commands.json` is not produced by the Visual Studio and Xcode generators; for those, use the
   File API compile groups returned by `get_target` / `find_file_targets`.
-- Directories starting with `.`, `node_modules`, `CMakeFiles` and `_deps` are not scanned.
 
 ## Development
 
@@ -189,10 +181,10 @@ npm run build     # compile TypeScript to dist/
 npm test          # build + unit and end-to-end tests (needs cmake and a C/C++ compiler; ninja optional)
 ```
 
-The end-to-end tests copy `test/fixtures/workspace` (two independent projects, one with presets) into a
-temporary directory, configure several build directories with File API queries (the test harness runs CMake,
-the server never does), including a Ninja Multi-Config one when `ninja` is available, and drive the compiled
-server over stdio with the MCP SDK client.
+The end-to-end tests copy `test/fixtures/workspace` (two independent projects) into a temporary directory,
+configure several build directories with File API queries (the test harness runs CMake, the server never
+does), including a Ninja Multi-Config one when `ninja` is available, and drive the compiled server over
+stdio with the MCP SDK client, passing those build directories on the command line.
 
 ## License
 

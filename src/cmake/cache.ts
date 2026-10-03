@@ -6,7 +6,7 @@ export interface CacheTxtEntry {
   value: string;
 }
 
-/** Minimal CMakeCache.txt parser, used before any File API reply exists. */
+/** Minimal CMakeCache.txt parser, used to identify a build directory and its source tree. */
 export function parseCMakeCacheTxt(text: string): Map<string, CacheTxtEntry> {
   const entries = new Map<string, CacheTxtEntry>();
   for (const raw of text.split(/\r?\n/)) {

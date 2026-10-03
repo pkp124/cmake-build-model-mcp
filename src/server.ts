@@ -34,8 +34,8 @@ const buildDirArg = z
   .string()
   .optional()
   .describe(
-    "Build directory (absolute, or relative to a workspace root). A source directory with a single build " +
-      "directory is also accepted. May be omitted when the workspace has exactly one build directory.",
+    "Build directory given when the server was started. An absolute path, or a unique suffix such as " +
+      "`build-debug`. Omit when the server was started with exactly one build directory.",
   );
 const configurationArg = z
   .string()
@@ -71,10 +71,10 @@ export function createServer(workspace: Workspace): McpServer {
       instructions:
         "Query the build model (targets, sources, compile flags, include paths, defines, dependencies, cache " +
         "variables, toolchains) of CMake projects via the CMake File API, plus the exact compile commands from " +
-        "compile_commands.json. The server is read-only and never runs CMake: build directories must already " +
-        "have been configured with File API queries. Start with `list_projects` to see the source projects and " +
-        "build directories in the workspace; most tools take a `buildDir` argument. Use `find_file_targets` to " +
-        "learn how a specific source or header file is compiled.",
+        "compile_commands.json. The server is read-only and never runs CMake. It only reads the build " +
+        "directories given at startup, which must already contain a File API reply. Start with " +
+        "`list_build_dirs`. Pass `buildDir` when more than one build directory was given. Use " +
+        "`find_file_targets` to learn how a specific source or header file is compiled.",
     },
   );
 
@@ -86,74 +86,31 @@ export function createServer(workspace: Workspace): McpServer {
     return { buildDir, reply, config };
   }
 
-  async function resolveFile(file: string): Promise<string> {
-    await workspace.ensureScanned();
-    return path.isAbsolute(file) ? path.normalize(file) : workspace.resolvePath(file);
-  }
-
   /** Build directories whose source tree contains `file`, or all of them if none does. */
   async function candidateBuildDirs(file: string, buildDir: string | undefined): Promise<string[]> {
     if (buildDir) return [await workspace.resolveBuildDir(buildDir)];
-    const all = await workspace.allBuildDirs();
-    if (!all.length) throw new WorkspaceError("No CMake build directories found in the workspace.");
+    const all = await workspace.listBuildDirs();
     const owning = all.filter((b) => b.sourceDir && isWithin(file, b.sourceDir));
     return (owning.length ? owning : all).map((b) => b.buildDir);
   }
 
   server.registerTool(
-    "list_projects",
+    "list_build_dirs",
     {
-      title: "List CMake projects and build directories",
+      title: "List build directories",
       description:
-        "Lists top-level CMake source projects and build directories found under the workspace roots, including " +
-        "which source directory each build directory belongs to, its generator/build type and whether a File API " +
-        "reply is available and up to date.",
-      inputSchema: {
-        rescan: z.boolean().optional().describe("Re-scan the workspace roots for new projects and build directories."),
-      },
+        "Lists the build directories given when the server was started, including each source directory, " +
+        "generator, build type, and whether a File API reply is available and up to date.",
+      inputSchema: {},
       annotations: READ_ONLY,
     },
-    handler(async ({ rescan }) => {
-      if (rescan) await workspace.rescan();
-      const { projects, buildDirs } = await workspace.listProjects();
+    handler(async () => {
+      const buildDirs = await workspace.listBuildDirs();
       const withStatus = await Promise.all(
         buildDirs.map(async (b) => ({ ...b, fileApi: await workspace.replyStatus(b.buildDir) })),
       );
-      return json({
-        roots: workspace.getRoots(),
-        projects: projects.map((p) => ({
-          ...p,
-          buildDirs: buildDirs.filter((b) => b.sourceDir === p.sourceDir).map((b) => b.buildDir),
-        })),
-        buildDirs: withStatus,
-      });
+      return json({ buildDirs: withStatus });
     }),
-  );
-
-  server.registerTool(
-    "register_build_dir",
-    {
-      title: "Register a build directory",
-      description:
-        "Adds an existing CMake build directory (one containing CMakeCache.txt) that lies outside the workspace " +
-        "roots, e.g. /tmp/build-foo, so the other tools can query it.",
-      inputSchema: { buildDir: z.string().describe("Path to the build directory.") },
-      annotations: READ_ONLY,
-    },
-    handler(async ({ buildDir }) => json(await workspace.registerBuildDir(buildDir))),
-  );
-
-  server.registerTool(
-    "list_presets",
-    {
-      title: "List CMake presets",
-      description:
-        "Lists the configure and build presets from CMakePresets.json / CMakeUserPresets.json of a source " +
-        "directory, with resolved binary directories.",
-      inputSchema: { sourceDir: z.string().describe("Source directory containing the presets file.") },
-      annotations: READ_ONLY,
-    },
-    handler(async ({ sourceDir }) => json(await workspace.presets(sourceDir))),
   );
 
   server.registerTool(
@@ -259,9 +216,14 @@ export function createServer(workspace: Workspace): McpServer {
         "returns the effective language, standard, flags, defines and include directories from the File API " +
         "together with the exact compiler command(s) from the build directory's compile_commands.json. For " +
         "headers not listed as sources, returns targets whose include directories contain the file. Searches " +
-        "all known build directories unless `buildDir` is given.",
+        "every build directory given at startup unless `buildDir` is given.",
       inputSchema: {
-        file: z.string().describe("Path to the file (absolute or relative to a workspace root)."),
+        file: z
+          .string()
+          .describe(
+            "Path to the file. Absolute, relative to the working directory, or relative to a build's source " +
+              "directory when that match is unique.",
+          ),
         buildDir: buildDirArg,
         configuration: configurationArg,
         includeBacktraces: z.boolean().default(false),
@@ -269,7 +231,7 @@ export function createServer(workspace: Workspace): McpServer {
       annotations: READ_ONLY,
     },
     handler(async ({ file, buildDir, configuration, includeBacktraces }) => {
-      const absFile = await resolveFile(file);
+      const absFile = await workspace.resolveFile(file);
       const candidates = await candidateBuildDirs(absFile, buildDir);
 
       const matches: FileMatch[] = [];
@@ -304,12 +266,18 @@ export function createServer(workspace: Workspace): McpServer {
       title: "Get compile commands",
       description:
         "Reads the exact compiler invocations from compile_commands.json in a build directory, filtered by file, " +
-        "path pattern, target and/or configuration. When `file` is given without `buildDir`, every build " +
-        "directory of the workspace that compiles the file is searched. Each entry has the working directory, " +
+        "path pattern, target and/or configuration. When `file` is given without `buildDir`, every given build " +
+        "directory whose source tree contains the file is searched. Each entry has the working directory, " +
         "the argument list, the original command string (when the database uses `command`) and the output file.",
       inputSchema: {
         buildDir: buildDirArg,
-        file: z.string().optional().describe("Exact source file path (absolute or relative to a workspace root)."),
+        file: z
+          .string()
+          .optional()
+          .describe(
+            "Exact source file path. Absolute, relative to the working directory, or relative to a build's " +
+              "source directory when that match is unique.",
+          ),
         filter: z.string().optional().describe("Source path filter: substring, glob or /regex/."),
         target: z.string().optional().describe("Only commands compiling objects of this target."),
         configuration: z
@@ -321,7 +289,7 @@ export function createServer(workspace: Workspace): McpServer {
       annotations: READ_ONLY,
     },
     handler(async ({ buildDir, file, filter, target, configuration, limit }) => {
-      const absFile = file ? await resolveFile(file) : undefined;
+      const absFile = file ? await workspace.resolveFile(file) : undefined;
       const candidates =
         absFile && !buildDir ? await candidateBuildDirs(absFile, undefined) : [await workspace.resolveBuildDir(buildDir)];
       const re = filter ? globOrRegex(filter) : undefined;

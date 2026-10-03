@@ -1,14 +1,12 @@
-import { promises as fs, type Dirent } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { readCMakeCacheTxt } from "./cmake/cache.js";
-import { loadPresets, type Presets } from "./cmake/presets.js";
 import { CompileCommandsDb } from "./compileCommands.js";
 import { findLatestReplyIndex, QUERY_HINT, Reply } from "./fileapi/reply.js";
 
 export interface WorkspaceOptions {
-  roots: string[];
-  maxScanDepth: number;
-  extraBuildDirs?: string[];
+  /** Build directories that already contain a CMake File API reply. */
+  buildDirs: string[];
 }
 
 export interface BuildDirInfo {
@@ -17,16 +15,6 @@ export interface BuildDirInfo {
   generator?: string;
   buildType?: string;
   configurationTypes?: string[];
-  /** How this build directory was found. */
-  origin: "scan" | "preset" | "registered";
-}
-
-export interface ProjectInfo {
-  sourceDir: string;
-  name?: string;
-  hasPresets: boolean;
-  /** True when found under a workspace root as a top-level CMakeLists.txt. */
-  discoveredByScan: boolean;
 }
 
 export interface ReplyStatus {
@@ -42,221 +30,126 @@ export interface ReplyStatus {
   stale?: boolean;
 }
 
-const SKIP_DIR_NAMES = new Set(["node_modules", "__pycache__", "CMakeFiles", "_deps", "venv", ".venv"]);
-const MAX_SCANNED_DIRS = 50_000;
-
 export class WorkspaceError extends Error {}
 
 export class Workspace {
-  private roots: string[];
+  private readonly requestedBuildDirs: string[];
   private readonly buildDirs = new Map<string, BuildDirInfo>();
-  private readonly projects = new Map<string, ProjectInfo>();
   private readonly replies = new Map<string, Reply>();
   private readonly compileDbs = new Map<string, CompileCommandsDb>();
-  private scanned: Promise<void> | undefined;
-  private pendingRoots: Promise<void> | undefined;
+  private loaded: Promise<void> | undefined;
 
   constructor(readonly options: WorkspaceOptions) {
-    this.roots = options.roots.map((r) => path.resolve(r));
+    this.requestedBuildDirs = [...new Set(options.buildDirs.map((d) => path.resolve(d)))];
   }
 
-  getRoots(): string[] {
-    return [...this.roots];
+  async ensureLoaded(): Promise<void> {
+    this.loaded ??= this.load();
+    return this.loaded;
   }
 
-  setRoots(roots: string[]): void {
-    this.roots = roots.map((r) => path.resolve(r));
-    this.scanned = undefined;
-  }
-
-  /** Defers scanning until `roots` resolves; an undefined or empty result keeps the current roots. */
-  setRootsAsync(roots: Promise<string[] | undefined>): void {
-    const pending = roots
-      .catch(() => undefined)
-      .then((dirs) => {
-        if (this.pendingRoots === pending) this.pendingRoots = undefined;
-        if (dirs?.length) this.setRoots(dirs);
-      });
-    this.pendingRoots = pending;
-  }
-
-  async ensureScanned(): Promise<void> {
-    while (this.pendingRoots) await this.pendingRoots;
-    this.scanned ??= this.scan();
-    return this.scanned;
-  }
-
-  async rescan(): Promise<void> {
-    while (this.pendingRoots) await this.pendingRoots;
-    this.scanned = this.scan();
-    return this.scanned;
-  }
-
-  private async scan(): Promise<void> {
-    for (const [dir, info] of this.buildDirs) {
-      if (info.origin === "scan" || info.origin === "preset") this.buildDirs.delete(dir);
+  private async load(): Promise<void> {
+    if (!this.requestedBuildDirs.length) {
+      throw new WorkspaceError(
+        "No build directory was given. Start the server with a build directory that already contains a CMake File API reply.",
+      );
     }
-    for (const [dir, info] of this.projects) {
-      if (info.discoveredByScan) this.projects.delete(dir);
-    }
-
-    const budget = { remaining: MAX_SCANNED_DIRS };
-    for (const root of this.roots) {
-      await this.scanDir(root, 0, false, budget);
-    }
-    for (const dir of this.options.extraBuildDirs ?? []) {
-      await this.addBuildDir(path.resolve(dir), "registered");
-    }
-    // Build directories may point at sources outside the roots, and presets may put
-    // build trees outside the roots, so cross-link both ways.
-    for (const info of [...this.buildDirs.values()]) {
-      if (info.sourceDir) await this.addProject(info.sourceDir, false);
-    }
-    for (const project of [...this.projects.values()]) {
-      if (!project.hasPresets) continue;
-      const presets = await loadPresets(project.sourceDir);
-      for (const preset of presets.configurePresets) {
-        if (preset.binaryDir && !this.buildDirs.has(preset.binaryDir)) {
-          await this.addBuildDir(preset.binaryDir, "preset");
-        }
-      }
+    for (const dir of this.requestedBuildDirs) {
+      await this.addBuildDir(dir);
     }
   }
 
-  private async scanDir(dir: string, depth: number, insideProject: boolean, budget: { remaining: number }) {
-    if (budget.remaining-- <= 0) return;
-    let entries: Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    const files = new Set(entries.filter((e) => e.isFile()).map((e) => e.name));
-    if (files.has("CMakeCache.txt")) {
-      await this.addBuildDir(dir, "scan");
-      return;
-    }
-    let childInsideProject = insideProject;
-    if (files.has("CMakeLists.txt") && !insideProject) {
-      await this.addProject(dir, true);
-      childInsideProject = true;
-    }
-    if (depth >= this.options.maxScanDepth) return;
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith(".") || SKIP_DIR_NAMES.has(entry.name)) continue;
-      await this.scanDir(path.join(dir, entry.name), depth + 1, childInsideProject, budget);
-    }
-  }
-
-  private async addProject(sourceDir: string, discoveredByScan: boolean): Promise<void> {
-    const existing = this.projects.get(sourceDir);
-    if (existing) {
-      existing.discoveredByScan ||= discoveredByScan;
-      return;
-    }
-    let name: string | undefined;
-    try {
-      const text = await fs.readFile(path.join(sourceDir, "CMakeLists.txt"), "utf8");
-      name = /^\s*project\s*\(\s*"?([A-Za-z0-9_.+\-]+)/im.exec(text)?.[1];
-    } catch {
-      return;
-    }
-    const hasPresets = (await exists(path.join(sourceDir, "CMakePresets.json"))) ||
-      (await exists(path.join(sourceDir, "CMakeUserPresets.json")));
-    this.projects.set(sourceDir, { sourceDir, name, hasPresets, discoveredByScan });
-  }
-
-  /** Records a build directory if it contains a CMakeCache.txt. Returns its info or undefined. */
-  private async addBuildDir(buildDir: string, origin: BuildDirInfo["origin"]): Promise<BuildDirInfo | undefined> {
+  /** Records a build directory that has a CMake cache or a File API reply. */
+  private async addBuildDir(buildDir: string): Promise<BuildDirInfo> {
     const cache = await readCMakeCacheTxt(path.join(buildDir, "CMakeCache.txt"));
-    if (!cache) return undefined;
-    const previous = this.buildDirs.get(buildDir);
-    const configTypes = cache.get("CMAKE_CONFIGURATION_TYPES")?.value;
+    const reply = await this.loadReply(buildDir);
+    if (!cache && !reply) {
+      throw new WorkspaceError(
+        `${buildDir} is not a CMake build directory (no CMakeCache.txt or File API reply).`,
+      );
+    }
+    const configTypes = cache?.get("CMAKE_CONFIGURATION_TYPES")?.value;
+    let sourceDir = cache?.get("CMAKE_HOME_DIRECTORY")?.value || undefined;
+    let generator = cache?.get("CMAKE_GENERATOR")?.value || undefined;
+    const buildType = cache?.get("CMAKE_BUILD_TYPE")?.value || undefined;
+    if (reply) {
+      generator ||= reply.index.cmake.generator.name;
+      const codemodel = await reply.object("codemodel");
+      if (codemodel) sourceDir ||= codemodel.paths.source;
+    }
     const info: BuildDirInfo = {
       buildDir,
-      sourceDir: cache.get("CMAKE_HOME_DIRECTORY")?.value || undefined,
-      generator: cache.get("CMAKE_GENERATOR")?.value || undefined,
-      buildType: cache.get("CMAKE_BUILD_TYPE")?.value || undefined,
+      sourceDir,
+      generator,
+      buildType,
       configurationTypes: configTypes ? configTypes.split(";").filter(Boolean) : undefined,
-      origin: previous?.origin === "registered" ? previous.origin : origin,
     };
     this.buildDirs.set(buildDir, info);
     return info;
   }
 
-  async registerBuildDir(buildDir: string): Promise<BuildDirInfo> {
-    await this.ensureScanned();
-    const abs = this.resolvePath(buildDir);
-    const info = await this.addBuildDir(abs, "registered");
-    if (!info) throw new WorkspaceError(`${abs} is not a CMake build directory (no CMakeCache.txt).`);
-    if (info.sourceDir) await this.addProject(info.sourceDir, false);
-    return info;
-  }
-
-  async listProjects(): Promise<{ projects: ProjectInfo[]; buildDirs: BuildDirInfo[] }> {
-    await this.ensureScanned();
-    return {
-      projects: [...this.projects.values()].sort((a, b) => a.sourceDir.localeCompare(b.sourceDir)),
-      buildDirs: [...this.buildDirs.values()].sort((a, b) => a.buildDir.localeCompare(b.buildDir)),
-    };
-  }
-
-  async allBuildDirs(): Promise<BuildDirInfo[]> {
-    return (await this.listProjects()).buildDirs;
+  async listBuildDirs(): Promise<BuildDirInfo[]> {
+    await this.ensureLoaded();
+    return [...this.buildDirs.values()].sort((a, b) => a.buildDir.localeCompare(b.buildDir));
   }
 
   getBuildDirInfo(buildDir: string): BuildDirInfo | undefined {
     return this.buildDirs.get(buildDir);
   }
 
-  /** Resolves a relative path against the first root it exists under (or the first root). */
-  resolvePath(p: string): string {
-    if (path.isAbsolute(p)) return path.normalize(p);
-    for (const root of this.roots) {
-      const candidate = path.resolve(root, p);
-      if (this.buildDirs.has(candidate) || this.projects.has(candidate)) return candidate;
+  /**
+   * Resolves `file` to an absolute path. Relative paths are resolved against the working
+   * directory, then against each build's source directory when exactly one of those exists.
+   */
+  async resolveFile(file: string): Promise<string> {
+    await this.ensureLoaded();
+    if (path.isAbsolute(file)) return path.normalize(file);
+    const fromCwd = path.resolve(file);
+    if (await exists(fromCwd)) return fromCwd;
+    const hits = new Set<string>();
+    for (const info of this.buildDirs.values()) {
+      if (!info.sourceDir) continue;
+      const candidate = path.resolve(info.sourceDir, file);
+      if (await exists(candidate)) hits.add(candidate);
     }
-    return path.resolve(this.roots[0] ?? process.cwd(), p);
+    if (hits.size === 1) return [...hits][0];
+    if (hits.size > 1) {
+      throw new WorkspaceError(
+        `${file} exists in more than one source directory; pass an absolute path:\n${[...hits].sort().map((h) => `- ${h}`).join("\n")}`,
+      );
+    }
+    return fromCwd;
   }
 
   /**
-   * Maps the user-supplied `buildDir` argument to a known build directory. Accepts a build
-   * directory, a source directory with exactly one build directory, or nothing when the
-   * workspace has exactly one build directory.
+   * Maps a tool's `buildDir` argument to one of the directories given at startup.
+   * An absolute path must match exactly. A relative path may be a unique suffix
+   * (`build-debug`, `app/build-debug`). Omit the argument when only one build directory was given.
    */
   async resolveBuildDir(input: string | undefined): Promise<string> {
-    await this.ensureScanned();
-    const all = [...this.buildDirs.values()];
+    await this.ensureLoaded();
+    const all = await this.listBuildDirs();
     if (!input) {
       if (all.length === 1) return all[0].buildDir;
-      if (all.length === 0) {
+      throw new WorkspaceError(
+        `Multiple build directories were given; pass \`buildDir\`:\n${all.map((b) => `- ${b.buildDir}`).join("\n")}`,
+      );
+    }
+    const abs = path.resolve(input);
+    if (this.buildDirs.has(abs)) return abs;
+    if (!path.isAbsolute(input)) {
+      const suffix = path.normalize(input);
+      const matches = all.filter((b) => b.buildDir === suffix || b.buildDir.endsWith(path.sep + suffix));
+      if (matches.length === 1) return matches[0].buildDir;
+      if (matches.length > 1) {
         throw new WorkspaceError(
-          "No CMake build directories found in the workspace. Configure a project with CMake first (with a " +
-            "File API query in place), or use `register_build_dir` to add one outside the workspace roots.",
+          `${input} matches several build directories; pick one:\n${matches.map((b) => `- ${b.buildDir}`).join("\n")}`,
         );
       }
-      throw new WorkspaceError(
-        `Multiple build directories exist; pass \`buildDir\`. Known build directories:\n${all.map((b) => `- ${b.buildDir}`).join("\n")}`,
-      );
     }
-    const abs = this.resolvePath(input);
-    if (this.buildDirs.has(abs)) return abs;
-    if (await exists(path.join(abs, "CMakeCache.txt"))) {
-      await this.addBuildDir(abs, "registered");
-      return abs;
-    }
-    const forSource = all.filter((b) => b.sourceDir && path.normalize(b.sourceDir) === abs);
-    if (forSource.length === 1) return forSource[0].buildDir;
-    if (forSource.length > 1) {
-      throw new WorkspaceError(
-        `${abs} is a source directory with several build directories; pick one:\n${forSource.map((b) => `- ${b.buildDir}`).join("\n")}`,
-      );
-    }
-    throw new WorkspaceError(`${abs} is not a known CMake build directory or configured source directory.`);
-  }
-
-  async presets(sourceDir: string): Promise<Presets> {
-    return loadPresets(this.resolvePath(sourceDir));
+    throw new WorkspaceError(
+      `${abs} is not one of the build directories given to the server:\n${all.map((b) => `- ${b.buildDir}`).join("\n")}`,
+    );
   }
 
   /** Returns the existing File API reply of a build directory, which must contain `kind`. */
