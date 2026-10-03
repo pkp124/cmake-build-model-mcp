@@ -269,7 +269,8 @@ async function readTree(file: string, warnings: string[], stamps: FileStamp[], s
         break;
       case "subdirs":
         for (const dir of command.args) {
-          const child = path.resolve(testBuildDir, dir, "CTestTestfile.cmake");
+          // subdirs() paths are relative to this file, not the "# Build directory:" header.
+          const child = path.resolve(path.dirname(real), dir, "CTestTestfile.cmake");
           try {
             await fs.access(child);
           } catch {

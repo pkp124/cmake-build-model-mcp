@@ -36,12 +36,12 @@ function compileCTestRegex(pattern: string): RegExp {
     }
     if (char === "(" && pattern[i + 1] === "?") {
       throw new CtestError(
-        `Invalid test regex ${quote(pattern)}: ctest regular expressions do not support '(?' groups.`,
+        `Invalid test regex ${quote(pattern)}: ctest does not support '(?' groups.`,
       );
     }
     if ((char === "*" || char === "+" || char === "?") && pattern[i + 1] === "?") {
       throw new CtestError(
-        `Invalid test regex ${quote(pattern)}: ctest regular expressions do not support lazy quantifiers.`,
+        `Invalid test regex ${quote(pattern)}: ctest does not support lazy quantifiers.`,
       );
     }
     if (char === "{" || char === "}") translated += `\\${char}`;

@@ -15,9 +15,8 @@ target_link_libraries(plugin PRIVATE core headers_only)
 
 add_custom_target(docs COMMAND ${CMAKE_COMMAND} -E echo "docs")
 
-add_subdirectory(tools)
-
 enable_testing()
+add_subdirectory(tools)
 set_property(DIRECTORY PROPERTY LABELS app)
 add_test(NAME app.pass COMMAND ${CMAKE_COMMAND} -E echo pass)
 set_tests_properties(app.pass PROPERTIES PASS_REGULAR_EXPRESSION "^pass" LABELS "unit;fast" TIMEOUT 15)
