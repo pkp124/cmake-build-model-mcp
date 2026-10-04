@@ -15,6 +15,8 @@ import {
   targetDetails,
   type FileMatch,
 } from "./model.js";
+import { CtestError } from "./ctest/error.js";
+import { registerCTestTools } from "./ctest/tools.js";
 import { Workspace, WorkspaceError } from "./workspace.js";
 
 export const SERVER_NAME = "cmake-build-model";
@@ -58,7 +60,7 @@ function handler<A>(fn: (args: A) => Promise<CallToolResult>): (args: A) => Prom
     try {
       return await fn(args);
     } catch (err) {
-      if (err instanceof WorkspaceError || err instanceof ModelError) return errorResult(err.message);
+      if (err instanceof WorkspaceError || err instanceof ModelError || err instanceof CtestError) return errorResult(err.message);
       return errorResult(`Unexpected error: ${(err as Error).stack ?? String(err)}`);
     }
   };
@@ -71,10 +73,12 @@ export function createServer(workspace: Workspace): McpServer {
       instructions:
         "Query the build model (targets, sources, compile flags, include paths, defines, dependencies, cache " +
         "variables, toolchains) of CMake projects via the CMake File API, plus the exact compile commands from " +
-        "compile_commands.json. The server is read-only and never runs CMake. It only reads the build " +
-        "directories given at startup, which must already contain a File API reply. Start with " +
-        "`list_build_dirs`. Pass `buildDir` when more than one build directory was given. Use " +
-        "`find_file_targets` to learn how a specific source or header file is compiled.",
+        "compile_commands.json. It also reads CTestTestfile.cmake (test names, labels, fixtures, dependencies) " +
+        "and CTest Test.xml results. It never runs test executables. preview_test_run is a dry run; its ctest " +
+        "engine runs `ctest --show-only` and does not execute tests. Start with `list_build_dirs`. Pass " +
+        "`buildDir` when more than one build directory was given. Use `find_file_targets` to learn how a " +
+        "specific source or header file is compiled, and `preview_test_run` to see which tests a -R/-E/-L/-LE " +
+        "selection would run.",
     },
   );
 
@@ -107,7 +111,11 @@ export function createServer(workspace: Workspace): McpServer {
     handler(async () => {
       const buildDirs = await workspace.listBuildDirs();
       const withStatus = await Promise.all(
-        buildDirs.map(async (b) => ({ ...b, fileApi: await workspace.replyStatus(b.buildDir) })),
+        buildDirs.map(async (b) => ({
+          ...b,
+          fileApi: await workspace.replyStatus(b.buildDir),
+          ctest: await workspace.ctestStatus(b.buildDir),
+        })),
       );
       return json({ buildDirs: withStatus });
     }),
@@ -414,5 +422,6 @@ export function createServer(workspace: Workspace): McpServer {
     }),
   );
 
+  registerCTestTools(server, workspace);
   return server;
 }
